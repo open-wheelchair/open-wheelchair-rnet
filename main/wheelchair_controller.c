@@ -7,18 +7,6 @@
 #include "pal.h"
 
 
-// pinout joystick controller
-
-
-// 1
-// 2
-// 3
-// 4
-// 5 = GND
-// 6
-// 7
-// 8
-
 // periodicities
 // serial packet every 50ms
 // joystick position every 10ms
@@ -26,15 +14,9 @@
 // HEARTBEAT 03c30f0f: 87 87 87 87 87 87 87 every 100ms
 // ^ does not get acked, so maybe we omit this one for now?
 
-typedef enum {
-    TID_SERIAL,
-    TID_JOYSTICK_POS,
-} timer_id_t;
-
 static const char *TAG = "comms";
 
 static const uint8_t SERIAL_NUMBER[8] = {0xf3, 0xc5, 0x1c, 0x62, 0, 0, 0, 0};
-//static const uint8_t AUTH_CHAL_JOYSTICK_TO_MOTOR[8] = {0x85, 0xe7, 0x1e, 0xca, 0xdb, 0x40, 0xcc, 0xef};
 
 // interesting! only the last 4 bytes changed
 static const uint8_t AUTH_CHAL_JOYSTICK_TO_MOTOR[8] = {0xa0, 0xa7, 0x5c, 0xea, 0xdb, 0x40, 0xcc, 0xef};
@@ -47,20 +29,7 @@ static can_frame_t serial_number_frame = {
     .data = {0},
 };
 
-typedef enum {
-    INIT,
-    AUTH_SENT_OK,
-    AUTH, // finished by receiving AUTH 1f72xxxx frame, then wait 100ms
-    AUTH_CHECK, // finished by receiving 7b0
-} controller_fsm_state_t;
-
-
-
-static controller_fsm_state_t fsm_state = INIT;
-
-void send_can_message(const mcp2515_ctx_t* ctx, const can_frame_t* frame) {
-    // log_can_frame(20, 0, *frame);
-
+void send_can_message(const can_hardware_ctx_t* ctx, const can_frame_t* frame) {
     eventqueue_item_t item = {
         .kind = EVKIND_FRAME,
         .d.frame = *frame
@@ -68,7 +37,6 @@ void send_can_message(const mcp2515_ctx_t* ctx, const can_frame_t* frame) {
 
     bool success = xQueueSendToBack(ctx->opposing_event_queue, &item, pdMS_TO_TICKS(100));
     if (success) {
-        printf("F%dF\n", uxQueueSpacesAvailable(ctx->opposing_event_queue));
         xSemaphoreGive(ctx->opposing_semaphore);
     } else {
         ESP_LOGE(TAG, "failed to queue frame %08lx len=%d", frame->can_id, frame->can_dlc);
@@ -76,7 +44,7 @@ void send_can_message(const mcp2515_ctx_t* ctx, const can_frame_t* frame) {
 }
 
 void periodic_pmtx_heartbeat(TimerHandle_t xTimer) {
-    mcp2515_ctx_t* ctx = (mcp2515_ctx_t*) pvTimerGetTimerID(xTimer);
+    can_hardware_ctx_t* ctx = (can_hardware_ctx_t*) pvTimerGetTimerID(xTimer);
 
     can_frame_t msg_pmtx_heartbeat = {
             .can_id = 0x03c30f0f | CAN_EFF_FLAG,
@@ -87,19 +55,20 @@ void periodic_pmtx_heartbeat(TimerHandle_t xTimer) {
     send_can_message(ctx, &msg_pmtx_heartbeat);
 }
 
-bool handle_receive_queue(const mcp2515_ctx_t* ctx, can_frame_t* frame_out, uint64_t ms_to_wait) {
+bool handle_receive_queue(const can_hardware_ctx_t* ctx, can_frame_t* frame_out, uint64_t ms_to_wait) {
     uint64_t finish_timestamp_us = esp_timer_get_time() + 1000*ms_to_wait;
     while (esp_timer_get_time() < finish_timestamp_us) {
-        uint64_t ticks_to_wait = pdMS_TO_TICKS((esp_timer_get_time() - finish_timestamp_us)/1000);
+        uint64_t ticks_to_wait = pdMS_TO_TICKS((finish_timestamp_us - esp_timer_get_time())/1000);
         if (ticks_to_wait == 0 && ms_to_wait > 0) {
             ticks_to_wait = 1;
         }
+        assert(ticks_to_wait * configTICK_RATE_HZ < 1000*1000);
         eventqueue_item_t item;
         bool received = xQueueReceive(ctx->incoming_event_queue, &item, ticks_to_wait);
         if (received) {
             if (item.kind == EVKIND_FRAME) {
                 *frame_out = item.d.frame;
-                ESP_LOGI(TAG, "found frame, %d msg waiting in queue", uxQueueMessagesWaiting(ctx->incoming_event_queue));
+                ESP_LOGI(TAG, "frame, %d left", uxQueueMessagesWaiting(ctx->incoming_event_queue));
                 return true;
             } else if (item.kind == EVKIND_TIMER) {
                 switch (item.d.timer_id) {
@@ -113,32 +82,32 @@ bool handle_receive_queue(const mcp2515_ctx_t* ctx, can_frame_t* frame_out, uint
     return false;
 }
 
-void poweron(mcp2515_ctx_t* ctx) {
+void poweron(can_hardware_ctx_t* ctx) {
     ESP_LOGW(TAG, "PHASE: poweron");
     const can_frame_t poweron_frame = {
         .can_id = 0x00C,
         .can_dlc = 0
     };
     send_can_message(ctx, &poweron_frame); // this will get continually resent until acked
-    // send_can_message(ctx, &poweron_frame);
-    // while (!has_seen_ack) {
-    //     // // TODO this busy-loops, not ideal
-    //     // // if queue is empty, queue a frame
-    //     // while (!has_seen_ack && uxQueueMessagesWaitingFromISR(ctx->opposing_event_queue) < 1 ) {
-    //     //     ESP_LOGI(TAG, "queueing poweron frame");
-    //     //     send_can_message(ctx, &poweron_frame);
-    //     // }
-    //     vTaskDelay(1);
-    // }
-    // vTaskDelay(1);
+
+    while (true) { // TODO timeout
+        eventqueue_item_t item;
+        bool received = xQueueReceive(ctx->incoming_event_queue, &item, 1);
+        if (received) {
+            if (item.kind == EVKIND_SIGNAL_FIRST_ACK) {
+                ESP_LOGI(TAG, "first ack");
+                break;
+            }
+        }
+    }
 }
 
 void periodic_serial_number(TimerHandle_t xTimer) {
-    mcp2515_ctx_t* ctx = (mcp2515_ctx_t*) pvTimerGetTimerID(xTimer);
+    can_hardware_ctx_t* ctx = (can_hardware_ctx_t*) pvTimerGetTimerID(xTimer);
     send_can_message(ctx, &serial_number_frame);
 }
 
-void start_pmtx(mcp2515_ctx_t* ctx) {
+void start_pmtx(can_hardware_ctx_t* ctx) {
     TimerHandle_t pmtx_timerhandle = xTimerCreate(
         "pmtx_tmr",
         pdMS_TO_TICKS(100),
@@ -150,20 +119,16 @@ void start_pmtx(mcp2515_ctx_t* ctx) {
     assert(xTimerStart(pmtx_timerhandle, 0));
 }
 
-void authenticate(mcp2515_ctx_t* ctx) {
+void authenticate(can_hardware_ctx_t* ctx, uint8_t node_id) {
     // Fill in serial number
     memcpy(serial_number_frame.data, SERIAL_NUMBER, sizeof(SERIAL_NUMBER));
 
     send_can_message(ctx, &serial_number_frame);
     send_can_message(ctx, &serial_number_frame);
 
-    //ESP_LOGW(TAG, "PHASE: auth init frame");
-    can_frame_t auth_init_frame = {
-        .can_id = 0x7b3,
-        .can_dlc = 0,
-    };
+    can_frame_t auth_init_frame = {.can_id = 0x7b3, .can_dlc = 0};
+
     send_can_message(ctx, &auth_init_frame);
-    ESP_LOGW(TAG, "PHASE: serial number");
 
     // Create 50 ms timer for serial number
     TimerHandle_t serial_timerhandle = xTimerCreate(
@@ -174,113 +139,86 @@ void authenticate(mcp2515_ctx_t* ctx) {
         periodic_serial_number
     );
     assert(serial_timerhandle);
+    assert(xTimerStart(serial_timerhandle, 0));
 
     can_frame_t rx_frame = {0};
     bool received = handle_receive_queue(ctx, &rx_frame, 10);
     assert(received && rx_frame.can_id == (0x7b3 | CAN_RTR_FLAG));
 
-    can_frame_t auth_frame_0 = {
-        .can_id = CAN_EFF_FLAG | 0x1f000000 | (0 << 20) | (AUTH_CHAL_JOYSTICK_TO_MOTOR[0] << 8) | SERIAL_NUMBER[0],
-        .can_dlc = 0
-    };
-    ESP_LOGW(TAG, "PHASE: 1");
-    send_can_message(ctx, &auth_frame_0);
-    vTaskDelay(pdMS_TO_TICKS(17));
-    send_can_message(ctx, &auth_frame_0);
+    // now, we wait for our slot in the authentication phase to come up
+    uint8_t current_slot = 0;
+    uint8_t my_auth_idx = 0;
 
-    {
-        can_frame_t rx_frame = {0};
-        bool received = handle_receive_queue(ctx, &rx_frame, 10);
-        assert(received && rx_frame.can_id == (0x7b3 | CAN_RTR_FLAG));
-        can_frame_t auth_frame_1 = {
-            .can_id = CAN_EFF_FLAG | 0x1f000000 | (1 << 20) | (AUTH_CHAL_JOYSTICK_TO_MOTOR[1] << 8) | SERIAL_NUMBER[1],
-            .can_dlc = 0
-        };
-        ESP_LOGW(TAG, "PHASE: 2");
-        send_can_message(ctx, &auth_frame_1);
-    }
+    int64_t start_time_us = esp_timer_get_time();
+    int64_t last_auth_frame_recvd = 0;
+    int64_t sent_7b1 = 0;
 
-    {
-        can_frame_t rx_frame = {0};
-        bool received = handle_receive_queue(ctx, &rx_frame, 10);
-        assert(received && rx_frame.can_id == (0x7b3 | CAN_RTR_FLAG));
-        vTaskDelay(pdMS_TO_TICKS(18));
-        ESP_LOGW(TAG, "PHASE: 3");
-        send_can_message(ctx, &serial_number_frame);
-        // Start serial timer handle here
-        assert(xTimerStart(serial_timerhandle, 0));
-    }
+    int64_t last_received_7b3 = esp_timer_get_time();
 
-    for (uint32_t auth_ctr = 0; auth_ctr < 8; auth_ctr++) {
-        can_frame_t auth_frame = {
-            .can_id = CAN_EFF_FLAG | 0x1f000000 | (auth_ctr << 20) | (AUTH_CHAL_JOYSTICK_TO_MOTOR[auth_ctr] << 8) | SERIAL_NUMBER[auth_ctr],
-            .can_dlc = 0
-        };
-        send_can_message(ctx, &auth_frame);
-    }
-    ESP_LOGW(TAG, "PHASE: 4");
-
-    {
-        can_frame_t rx_frame = {0};
-        bool received = handle_receive_queue(ctx, &rx_frame, 60);
-        assert(received && rx_frame.can_id == (0x7b3 | CAN_RTR_FLAG));
-        send_can_message(ctx, &auth_init_frame);
-        vTaskDelay(pdMS_TO_TICKS(10));
-        // send_can_message(ctx, &serial_number_frame);
-    }
-    ESP_LOGW(TAG, "PHASE: 5");
-    {
-        bool received = handle_receive_queue(ctx, &rx_frame, 10);
-        assert(received && rx_frame.can_id == 0x7b3);
-    }
-    ESP_LOGW(TAG, "PHASE: 6");
-    for (uint32_t auth_ctr = 0; auth_ctr < 8; auth_ctr++) {
-        can_frame_t auth_frame = {
-            .can_id = CAN_EFF_FLAG | 0x1f000000 | (auth_ctr << 20) | (AUTH_CHAL_JOYSTICK_TO_MOTOR[auth_ctr] << 8) | SERIAL_NUMBER[auth_ctr],
-            .can_dlc = 0
-        };
-        send_can_message(ctx, &auth_frame);
-    }
-    fsm_state = INIT;
-
-    ESP_LOGW(TAG, "PHASE: waiting for auth 72");
-    while (fsm_state == INIT) {
-        bool received = handle_receive_queue(ctx, &rx_frame, 1);
-        if (received) {
-            if (((rx_frame.can_id & CAN_EFF_MASK) & 0xff000000) == 0x1f000000) {
-                ESP_LOGI(TAG, "auth frame");
-                if (((rx_frame.can_id & CAN_EFF_MASK) & 0xffff0000) == 0x1f720000) {
-                    fsm_state = AUTH_SENT_OK;
-                }
-            } else {
-                ESP_LOGE(TAG, "unexpected frame!");
+    while (true) {
+        if (esp_timer_get_time() - start_time_us > 1000*1000) {
+            ESP_LOGI(TAG, "stuck too long in auth");
+            abort();
+        }
+        if (current_slot == node_id && esp_timer_get_time() - last_received_7b3 > 20*1000 ) {
+            can_frame_t auth_frame = {
+                .can_id = CAN_EFF_FLAG | 0x1f000000 | (my_auth_idx << 20) | (current_slot << 16) | (AUTH_CHAL_JOYSTICK_TO_MOTOR[my_auth_idx] << 8) | SERIAL_NUMBER[my_auth_idx],
+                .can_dlc = 0
+            };
+            send_can_message(ctx, &auth_frame);
+            last_auth_frame_recvd = esp_timer_get_time();
+            my_auth_idx++;
+            if (my_auth_idx == 8) {
+                current_slot++;
             }
         }
-    }
-    ESP_LOGW(TAG, "PHASE: serials and 7b1");
-    vTaskDelay(pdMS_TO_TICKS(50));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    vTaskDelay(pdMS_TO_TICKS(30));
-    can_frame_t auth_confirm_frame = {
-        .can_id = 0x7b1,
-        .can_dlc = 0,
-    };
-    send_can_message(ctx, &auth_confirm_frame);
-    vTaskDelay(pdMS_TO_TICKS(40));
-    {
-        bool received = handle_receive_queue(ctx, &rx_frame, 200);
-        assert(received && (rx_frame.can_id == 0x7b0 || rx_frame.can_id == (CAN_RTR_FLAG | 0x7b0) ));
-        // TODO what does 0x7b0 RTR mean? in the captures of the real controller, we only ever see without RTR
-        if (rx_frame.can_id == (CAN_RTR_FLAG | 0x7b0)) {
-            ESP_LOGE(TAG, "saw 7b0 RTR frame");
+        if (current_slot > node_id && esp_timer_get_time() - last_auth_frame_recvd > 90*1000 && sent_7b1 == 0) {
+            sent_7b1 = esp_timer_get_time();
+            can_frame_t auth_finish_frame = {.can_id = 0x7b1, .can_dlc = 0};
+            send_can_message(ctx, &auth_finish_frame);
+        }
+        if (handle_receive_queue(ctx, &rx_frame, 1)) {
+            if ((rx_frame.can_id & 0x1f000000) == 0x1f000000) {
+                last_auth_frame_recvd = esp_timer_get_time();
+                uint8_t rx_node = (rx_frame.can_id >> 16) & 0xff;
+                uint8_t rx_auth_idx = (rx_frame.can_id >> 20) & 0xff;
+                if (rx_auth_idx == 7) {
+                    current_slot = rx_node + 1;
+                }
+            }
+            if (rx_frame.can_id == (0x7b3 | CAN_RTR_FLAG)) {
+                current_slot = 0;
+                my_auth_idx = 0;
+                last_received_7b3 = esp_timer_get_time();
+            }
+            if (rx_frame.can_id == 0x7b0 || (rx_frame.can_id == (0x7b0 | CAN_RTR_FLAG))) {
+                // we're done!
+                if (current_slot <= node_id) {
+                    ESP_LOGE(TAG, "got 7b0, but not succesful!");
+                    abort();
+                }
+                if (rx_frame.can_id == (0x7b0 | CAN_RTR_FLAG)) {
+                    ESP_LOGE(TAG, "got 7b0 RTR, expect weirdness");
+                }
+                ESP_LOGW(TAG, "finished authentication");
+                break;
+            }
+            if (rx_frame.can_id == 0x7b2) {
+                ESP_LOGE(TAG, "Got 7b2");
+                abort();
+            }
+        }
+        if (sent_7b1 != 0 && esp_timer_get_time() - sent_7b1 > 100*1000) {
+            ESP_LOGE(TAG, "did not receive auth confirm frame in time");
+            abort();
         }
     }
-    vTaskDelay(pdMS_TO_TICKS(10));
+
     start_pmtx(ctx);
 }
 
 // receives until there is an exact match with an expected frame
-bool receive_but_ignore_non_specific_frame(mcp2515_ctx_t* ctx, can_frame_t* expected, uint64_t ms_to_wait) {
+bool receive_but_ignore_non_specific_frame(can_hardware_ctx_t* ctx, can_frame_t* expected, uint64_t ms_to_wait) {
     uint64_t finish_timestamp_us = esp_timer_get_time() + 1000*ms_to_wait;
     while (esp_timer_get_time() < finish_timestamp_us) {
         uint64_t ticks_to_wait = pdMS_TO_TICKS((esp_timer_get_time() - finish_timestamp_us)/1000);
@@ -309,7 +247,7 @@ bool receive_but_ignore_non_specific_frame(mcp2515_ctx_t* ctx, can_frame_t* expe
     return false;
 }
 
-void parameter_transaction(mcp2515_ctx_t* ctx, uint8_t* request, uint8_t* expected_response) {
+void parameter_transaction(can_hardware_ctx_t* ctx, uint8_t* request, uint8_t* expected_response) {
     can_frame_t transaction_request = {
         .can_id = 0x780,
         .can_dlc = 8,
@@ -366,7 +304,7 @@ uint8_t hardcoded_parameters[][2][8] = {
     {0x20, 0x50, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x00}},
 };
 
-void parameter_map(mcp2515_ctx_t* ctx) {
+void parameter_map(can_hardware_ctx_t* ctx) {
     uint8_t first_t_req[8] = {0x22, 0x80, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00};
     uint8_t first_t_res[8] = {0xc0, 0x80, 0x00, 0x00, 0x26, 0x00, 0x00, 0x00};
 
@@ -448,14 +386,12 @@ void parameter_map(mcp2515_ctx_t* ctx) {
             .data = {0} // TODO this can be changed!
     };
     send_can_message(ctx, &msg_maxspeed);
-    // vTaskDelay(pdMS_TO_TICKS(1400));
-    vTaskDelay(1400);
 }
 
 uint64_t starttime = 0;
 
 void periodic_joystick(TimerHandle_t xTimer) {
-    mcp2515_ctx_t* ctx = (mcp2515_ctx_t*) pvTimerGetTimerID(xTimer);
+    can_hardware_ctx_t* ctx = (can_hardware_ctx_t*) pvTimerGetTimerID(xTimer);
 
     uint64_t current_time = esp_timer_get_time();
     if (starttime == 0) {
@@ -475,7 +411,7 @@ void periodic_joystick(TimerHandle_t xTimer) {
     send_can_message(ctx, &msg_joystick);
 }
 
-void start_joystick(mcp2515_ctx_t* ctx) {
+void start_joystick(can_hardware_ctx_t* ctx) {
     TimerHandle_t joystick_timerhandle = xTimerCreate(
         "joy_tmr",
         pdMS_TO_TICKS(10),
@@ -488,10 +424,10 @@ void start_joystick(mcp2515_ctx_t* ctx) {
 }
 
 void comms_task(void* pvParam) {
-    mcp2515_ctx_t* ctx = (mcp2515_ctx_t*) pvParam;
+    can_hardware_ctx_t* ctx = (can_hardware_ctx_t*) pvParam;
 
     poweron(ctx);
-    authenticate(ctx);
+    authenticate(ctx, 0);
     parameter_map(ctx);
     start_joystick(ctx);
 

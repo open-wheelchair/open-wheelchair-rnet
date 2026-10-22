@@ -57,3 +57,10 @@ Reverse engineered a bit of the communication protocol using https://github.com/
 Started with implementing the firmware. For now, we use an MCP2515 dev board (even though it does high speed CAN instead of fault-tolerant CAN). Eventually, we'll design a custom PCB.
 
 At this time, a lot of initialization / authentication / addresses are very specific to the one wheelchair on my research bench, so this project is currently likely not reproducible as-is. That said, we will eventually also reverse engineer this.
+
+### 2026-10-22
+
+Rewrote the hardware stack to use proper fault-tolerant CAN transceiver and the native TWAI (ESP32's term for CAN) controller in the ESP32.
+Upgraded to ESP-IDF v6.1.0.
+Also rewrote the authentication code to make the initial handshake both less code, less hardcoded, and more robust (hopefully!). Still not swapable to other wheelchairs without changing the code.
+

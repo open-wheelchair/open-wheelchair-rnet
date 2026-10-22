@@ -1,12 +1,11 @@
 #pragma once
 
-#include "mcp2515.h"
 #include "freertos/FreeRTOS.h"
 
 extern volatile bool has_seen_ack;
 
 typedef struct {
-    MCP2515 mcp_hardware_instance;
+    void* hw;
     QueueHandle_t incoming_event_queue;
     QueueHandle_t opposing_event_queue;
     // TODO move out the semaphores and do everything via event queues
@@ -14,13 +13,13 @@ typedef struct {
     SemaphoreHandle_t incoming_semaphore;
     SemaphoreHandle_t opposing_semaphore;
     int id;
-} mcp2515_ctx_t;
+} can_hardware_ctx_t;
 
 
 typedef enum {
     EVKIND_FRAME,
     EVKIND_TIMER,
-    EVKIND_SIGNAL
+    EVKIND_SIGNAL_FIRST_ACK
 } eventkind_t;
 
 typedef struct {
