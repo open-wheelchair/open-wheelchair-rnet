@@ -18,7 +18,6 @@ typedef struct {
 
 typedef enum {
     EVKIND_FRAME,
-    EVKIND_TIMER,
     EVKIND_SIGNAL_FIRST_ACK
 } eventkind_t;
 
@@ -26,7 +25,6 @@ typedef struct {
     eventkind_t kind;
     union {
         can_frame_t frame;
-        int timer_id;
     } d;
 } eventqueue_item_t;
 

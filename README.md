@@ -64,3 +64,6 @@ Rewrote the hardware stack to use proper fault-tolerant CAN transceiver and the 
 Upgraded to ESP-IDF v6.1.0.
 Also rewrote the authentication code to make the initial handshake both less code, less hardcoded, and more robust (hopefully!). Still not swapable to other wheelchairs without changing the code.
 
+## 2026-10-24
+
+Rewrote the software to be async and use state machines instead of the code being peppered with send() and recv() calls. This state-machine architecture now also makes it a lot nicer to work on features like changing mode / speed / profiles. Figured out a lot of the 'node address' fields in packets by looking at two different wheelchairs with the joystick and motor controller (PM) on different addresses.
