@@ -22,7 +22,7 @@ void pal_push_wireless(pal_wireless_input_t* wireless_input) {
     xQueueOverwrite(pal_wireless_queue, wireless_input);
 }
 
-void pal_get_joystick(uint8_t* right_out, uint8_t* fwd_out) {
+void pal_get_joystick(uint8_t* right_out, uint8_t* fwd_out, bool* is_seating_mode_out) {
     static pal_serial_input_t serial_input = {0};
     static pal_wireless_input_t wireless_input = {0};
 
@@ -31,6 +31,7 @@ void pal_get_joystick(uint8_t* right_out, uint8_t* fwd_out) {
     // safe value
     *right_out = 0;
     *fwd_out = 0;
+    *is_seating_mode_out = false;
 
     // First, try to refresh both inputs
     pal_serial_input_t new_serial_input = {0};
@@ -51,6 +52,7 @@ void pal_get_joystick(uint8_t* right_out, uint8_t* fwd_out) {
     if (!wireless_input.use_serial) {
         *right_out = wireless_input.right;
         *fwd_out = wireless_input.fwd;
+        *is_seating_mode_out = wireless_input.is_seating_mode;
         return;
     }
     // Wireless indicates that serial should be used, but it should also be valid
@@ -60,4 +62,5 @@ void pal_get_joystick(uint8_t* right_out, uint8_t* fwd_out) {
     // serial is valid
     *right_out = serial_input.right;
     *fwd_out = serial_input.fwd;
+    *is_seating_mode_out = serial_input.is_seating_mode;
 }

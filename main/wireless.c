@@ -54,19 +54,21 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     //     ESP_LOGI(TAG, "Receive unicast ESPNOW data");
     // }
 
-    if (len == 9 && memcmp(data, "ROBOB", 5) == 0) {
+    if (len == 10 && memcmp(data, "ROBOB", 5) == 0) {
         // Reasonably sure this is a control packet
         // TODO use encryption
         bool manual_mode = !!data[5];
-        uint8_t joystick_fwd_encoded = data[6];
-        uint8_t joystick_right_encoded = data[7];
-        uint8_t auto_speed = data[8];
+        bool is_seating_mode = !!data[6];
+        uint8_t joystick_fwd_encoded = data[7];
+        uint8_t joystick_right_encoded = data[8];
+        uint8_t auto_speed = data[9];
         // TODO use auto_speed
         (void) auto_speed;
 
         pal_wireless_input_t wireless_input = {
             .fwd = joystick_fwd_encoded,
             .right = joystick_right_encoded,
+            .is_seating_mode = is_seating_mode,
             .use_serial = !manual_mode,
             .timestamp_us = esp_timer_get_time()
         };
@@ -82,7 +84,7 @@ esp_err_t espnow_init(void)
     ESP_ERROR_CHECK( esp_now_register_recv_cb(espnow_recv_cb) );
 
     /* Add broadcast peer information to peer list. */
-    esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
+    esp_now_peer_info_t *peer = (esp_now_peer_info_t*) malloc(sizeof(esp_now_peer_info_t));
     assert(peer);
     memset(peer, 0, sizeof(esp_now_peer_info_t));
     peer->channel = ESPNOW_CHANNEL;

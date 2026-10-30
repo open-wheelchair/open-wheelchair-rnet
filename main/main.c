@@ -39,7 +39,7 @@ TaskHandle_t logging_task_handle = NULL;
 
 QueueHandle_t logging_queue = NULL;
 typedef struct {
-    uint64_t timestamp_us;
+    int64_t timestamp_us;
     can_frame_t frame;
     uint8_t receiver;
     uint8_t slot;
@@ -70,7 +70,7 @@ static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_
     };
     if (ESP_OK == twai_node_receive_from_isr(handle, &rx_frame)) {
         can_frame_t frame = {0};
-        frame.can_dlc = rx_frame.header.dlc;
+        frame.can_dlc = (uint8_t) rx_frame.header.dlc;
         memcpy(frame.data, rx_frame.buffer, frame.can_dlc);
         frame.can_id = rx_frame.header.id;
         if (rx_frame.header.ide) {
@@ -150,13 +150,13 @@ void can_hardware_task(void *pvParam) {
             if (item.kind == EVKIND_FRAME) {
                 log_can_frame(20, 0, item.d.frame);
                 // contains a frame, so queue it
-                uint8_t* send_buffer = malloc(8);
+                uint8_t* send_buffer = (uint8_t*) malloc(8);
                 memcpy(send_buffer, item.d.frame.data, item.d.frame.can_dlc);
 
-                twai_frame_t* tx_msg = calloc(1, sizeof(twai_frame_t));
+                twai_frame_t* tx_msg = (twai_frame_t*) calloc(1, sizeof(twai_frame_t));
                 tx_msg->header.id = item.d.frame.can_id & CAN_EFF_MASK;
-                tx_msg->header.ide = (item.d.frame.can_id & CAN_EFF_FLAG) ? 1 : 0; // extended
-                tx_msg->header.rtr = (item.d.frame.can_id & CAN_RTR_FLAG) ? 1 : 0;
+                tx_msg->header.ide = (uint8_t)((item.d.frame.can_id & CAN_EFF_FLAG) ? 1 : 0); // extended
+                tx_msg->header.rtr = (uint8_t)((item.d.frame.can_id & CAN_RTR_FLAG) ? 1 : 0);
                 tx_msg->buffer = send_buffer;        // Pointer to data to transmit
                 tx_msg->buffer_len = item.d.frame.can_dlc;  // Length of data to transmit
                 ESP_ERROR_CHECK(twai_node_transmit(node_hdl, tx_msg, 0));  // Timeout = 0: returns immediately if queue is full

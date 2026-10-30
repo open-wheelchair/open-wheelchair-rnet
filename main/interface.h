@@ -12,7 +12,7 @@ typedef struct {
     // we will then likely need to buffer the messages waiting in another queue
     SemaphoreHandle_t incoming_semaphore;
     SemaphoreHandle_t opposing_semaphore;
-    int id;
+    uint8_t id;
 } can_hardware_ctx_t;
 
 

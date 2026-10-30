@@ -110,7 +110,7 @@ typedef struct {
     uint8_t my_auth_idx;
 } auth_state_t;
 
-typedef enum {
+typedef enum param_fsm_t {
     PARAM_STATE_IDLE,
     PARAM_STATE_BLOCKED_WAITING_ANSWER,
     PARAM_STATE_BLOCKED_WAITING_IDLE,
@@ -149,11 +149,13 @@ typedef struct {
     uint32_t bitmask_ack_seen;
 } ready_state_t;
 
-typedef enum {
-    MODE_STATE_CLOSED,
+typedef enum mode_state_fsm_substate_t {
+    MODE_STATE_FULLY_CLOSED,
     MODE_STATE_OPENING,
-    MODE_STATE_OPEN,
+    MODE_STATE_ON_OPEN,
+    MODE_STATE_FULLY_OPEN,
     MODE_STATE_CLOSING,
+    MODE_STATE_ON_CLOSE,
 } mode_state_fsm_substate_t;
 
 typedef struct {
@@ -162,6 +164,9 @@ typedef struct {
     int64_t ts_transition_begin;
 
     mode_state_fsm_substate_t mode_fsm;
+
+    uint8_t known_drive_mode;
+    uint8_t known_seating_mode;
 } mode_state_t;
 
 typedef struct {
@@ -259,7 +264,7 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
     // MODE subsystem (only active if READY)
     if (state->ready_substate.bitmask_ack_seen == state->ready_substate.bitmask_expected) {
         switch (state->mode_substate.mode_fsm) {
-            case MODE_STATE_CLOSED: {
+            case MODE_STATE_FULLY_CLOSED: {
                 // it's closed, let's open it
                 can_frame_t msg_open_mode = {
                     .can_id = 0x060 | state->own_node_address,
@@ -271,7 +276,26 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
                 state->mode_substate.ts_transition_begin = timestamp;
                 break;
             }
-            case MODE_STATE_OPEN: {
+            case MODE_STATE_ON_CLOSE: {
+                // TODO this should not compile
+                state->mode_substate.mode_fsm = MODE_STATE_CLOSING;
+                break;
+            }
+
+            case MODE_STATE_ON_OPEN: {
+                if (state->mode_substate.current_mode == state->mode_substate.known_drive_mode) {
+                    can_frame_t msg_maxspeed = {
+                        .can_id = 0x0a040000 | state->own_node_address << 8 | CAN_EFF_FLAG,
+                        .can_dlc = 1,
+                        .data = {0} // TODO this can be changed!
+                    };
+                    send_can_message(state->hw_ctx, &msg_maxspeed);
+                }
+                state->mode_substate.mode_fsm = MODE_STATE_FULLY_OPEN;
+                break;
+            }
+
+            case MODE_STATE_FULLY_OPEN: {
                 if (state->mode_substate.current_mode != state->mode_substate.desired_mode) {
                     // begin transitioning
                     // it's open in the wrong mode, so first close it
@@ -281,7 +305,7 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
                         .data = {0x40, 0x10 | state->mode_substate.current_mode, 0, 0}
                     };
                     send_can_message(state->hw_ctx, &msg_close_mode);
-                    state->mode_substate.mode_fsm = MODE_STATE_OPENING;
+                    state->mode_substate.mode_fsm = MODE_STATE_CLOSING;
                     state->mode_substate.ts_transition_begin = timestamp;
                     }
                 break;
@@ -289,7 +313,7 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
 
             case MODE_STATE_CLOSING:
             case MODE_STATE_OPENING: {
-                if (timestamp - state->mode_substate.ts_transition_begin > 20*1000) {
+                if (timestamp - state->mode_substate.ts_transition_begin > 5000*1000) {
                     ESP_LOGE(TAG, "mode transition took too long");
                     abort();
                 }
@@ -426,7 +450,7 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
             break;
         }
         case INIT_STATE_WAIT_MODE: {
-            if (state->mode_substate.mode_fsm == MODE_STATE_OPEN && state->mode_substate.desired_mode == state->mode_substate.current_mode) {
+            if (state->mode_substate.mode_fsm == MODE_STATE_FULLY_OPEN && state->mode_substate.desired_mode == state->mode_substate.current_mode) {
                 ESP_LOGW(TAG, "PHASE MODE CHANGE DONE");
                 can_frame_t msg_motor_something = {
                         .can_id = 0x0c180002 | state->own_node_address << 8 |  CAN_EFF_FLAG,
@@ -434,13 +458,6 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
                         .data = {0, 3}
                 };
                 send_can_message(state->hw_ctx, &msg_motor_something);
-                can_frame_t msg_maxspeed = {
-                        .can_id = 0x0a040000 | state->own_node_address << 8 | CAN_EFF_FLAG,
-                        .can_dlc = 1,
-                        .data = {0} // TODO this can be changed!
-                };
-                send_can_message(state->hw_ctx, &msg_maxspeed);
-
                 state->init_fsm = INIT_STATE_DONE;
             }
         }
@@ -469,12 +486,25 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
     }
 
     // joystick timer
-    if (state->init_fsm == INIT_STATE_DONE && state->mode_substate.mode_fsm == MODE_STATE_OPEN) {
+    if (state->init_fsm == INIT_STATE_DONE && state->mode_substate.mode_fsm == MODE_STATE_FULLY_OPEN) {
         if (timestamp - state->ts_joystick_position_publication > 20*1000) {
             uint8_t right = 0;
             uint8_t fwd = 0;
-            pal_get_joystick(&right, &fwd);
+            bool is_seating_mode = true;
+            pal_get_joystick(&right, &fwd, &is_seating_mode);
 
+            // check that mode is current mode is mode specified by input, else set desired mode to the input mode
+            if (is_seating_mode) {
+                if (state->mode_substate.current_mode != state->mode_substate.known_seating_mode) {
+                    state->mode_substate.desired_mode = state->mode_substate.known_seating_mode;
+                    return;
+                }
+            } else {
+                if (state->mode_substate.current_mode != state->mode_substate.known_drive_mode) {
+                    state->mode_substate.desired_mode = state->mode_substate.known_drive_mode;
+                    return;
+                }
+            }
             can_frame_t msg_joystick = {
                     .can_id = 0x02000000 | state->own_node_address << 8 | CAN_EFF_FLAG,
                     .can_dlc = 2,
@@ -545,12 +575,16 @@ void init_receive(joystick_state_t* state, int64_t timestamp, can_frame_t* frame
             // this is confirmation
             switch (state->mode_substate.mode_fsm) {
                 case MODE_STATE_OPENING: {
-                    state->mode_substate.mode_fsm = MODE_STATE_OPEN;
+                    // BUG!! should be detected by compiler
+                    state->mode_substate.mode_fsm = PARAM_STATE_BLOCKED_WAITING_ANSWER;
+                    state->mode_substate.mode_fsm = MODE_STATE_ON_OPEN;
                     state->mode_substate.current_mode = state->mode_substate.desired_mode;
+                    ESP_LOGW(TAG, "mode open %d success", state->mode_substate.current_mode);
                     break;
                 }
                 case MODE_STATE_CLOSING: {
-                    state->mode_substate.mode_fsm = MODE_STATE_CLOSED;
+                    state->mode_substate.mode_fsm = MODE_STATE_ON_CLOSE;
+                    ESP_LOGW(TAG, "mode close %d success", state->mode_substate.current_mode);
                     break;
                 }
                 default: {
@@ -639,12 +673,14 @@ void comms_task(void* pvParam) {
             .bitmask_expected = 0b111, // three nodes
         },
         .mode_substate = {
-            .desired_mode = 0
+            .desired_mode = 0,
+            .known_drive_mode = 0,
+            .known_seating_mode = 1,
         }
     };
 
     while (true) {
-        eventqueue_item_t item = {0};
+        eventqueue_item_t item = {};
         if (xQueueReceive(ctx->incoming_event_queue, &item, 1)) {
             if (item.kind == EVKIND_FRAME) {
                 init_receive(&state, esp_timer_get_time(), &(item.d.frame));
