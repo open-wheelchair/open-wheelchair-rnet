@@ -48,7 +48,7 @@ Please also keep this in mind when opening issues or PRs to contribute. Be reaso
 
 ## Dev log
 
-Top post is most recent.
+Bottom post is most recent.
 
 ### 2026-10-19
 
@@ -67,3 +67,7 @@ Also rewrote the authentication code to make the initial handshake both less cod
 ## 2026-10-24
 
 Rewrote the software to be async and use state machines instead of the code being peppered with send() and recv() calls. This state-machine architecture now also makes it a lot nicer to work on features like changing mode / speed / profiles. Figured out a lot of the 'node address' fields in packets by looking at two different wheelchairs with the joystick and motor controller (PM) on different addresses.
+
+## 2026-10-30
+
+Added mode changing to seating mode (so now you can both drive & change seating, but not at the same time). Also investigated turning on more compiler warnings to get more warnings, but was unfortunately stopped by the code in the ESP-IDF not being warning-free, so then I'd have to turn off `-Werror`. Might still be useful to turn them on before each release, just to check that there are no warnings in our own code.
