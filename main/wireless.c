@@ -12,7 +12,7 @@
 #include "wireless.h"
 #include "pal.h"
 
-const char* TAG = "wireless";
+static const char* TAG = "wireless";
 
 #define ESPNOW_CHANNEL (4)
 

@@ -16,7 +16,7 @@ static const char* TAG = "uart_input";
 
 #define BUF_SIZE (1024)
 #define RD_BUF_SIZE (BUF_SIZE)
-static QueueHandle_t uart0_queue;
+static QueueHandle_t uart2_queue;
 
 
 uint8_t msg_buf_encoded[256];
@@ -32,13 +32,16 @@ static void handle_msg(const uint8_t* buffer, const size_t len) {
     }
     switch (buffer[0]) {
         case COMM_TYPE_JOYSTICK: {
-            if (len < 3) {
+            if (len < 5) {
                 return;
             }
             pal_serial_input_t pal_input = {
                 .right = buffer[1],
                 .fwd = buffer[2],
-                .timestamp_us = esp_timer_get_time()
+                .is_seating_mode = buffer[3] != 0,
+                .seating_axis = buffer[4],
+
+                .timestamp_us = esp_timer_get_time(),
             };
             pal_push_serial(&pal_input);
 
@@ -57,17 +60,17 @@ static void uart_event_task(void *pvParameters)
     uint8_t* dtmp = (uint8_t*) malloc(RD_BUF_SIZE);
     for (;;) {
         //Waiting for UART event.
-        if (xQueueReceive(uart0_queue, (void *)&event, (TickType_t)portMAX_DELAY)) {
+        if (xQueueReceive(uart2_queue, (void *)&event, (TickType_t)1000)) {
             bzero(dtmp, RD_BUF_SIZE);
-            // ESP_LOGI(TAG, "uart[%d] event:", UART_NUM_0);
+            // ESP_LOGI(TAG, "uart[%d] event:", UART_NUM_2);
             switch (event.type) {
             //Event of UART receiving data
             /*We'd better handler data event fast, there would be much more data events than
             other types of events. If we take too much time on data event, the queue might
             be full.*/
             case UART_DATA:
-                uart_read_bytes(UART_NUM_0, dtmp, event.size, portMAX_DELAY);
-                for (int i = 0; i < event.size; i++) {
+                int len = uart_read_bytes(UART_NUM_2, dtmp, event.size, portMAX_DELAY);
+                for (int i = 0; i < len; i++) {
                     msg_buf_encoded[msg_buf_encoded_idx] = dtmp[i];
                     msg_buf_encoded_idx++;
                     if (dtmp[i] == 0) {
@@ -100,16 +103,16 @@ static void uart_event_task(void *pvParameters)
                 // If fifo overflow happened, you should consider adding flow control for your application.
                 // The ISR has already reset the rx FIFO,
                 // As an example, we directly flush the rx buffer here in order to read more data.
-                uart_flush_input(UART_NUM_0);
-                xQueueReset(uart0_queue);
+                uart_flush_input(UART_NUM_2);
+                xQueueReset(uart2_queue);
                 break;
             //Event of UART ring buffer full
             case UART_BUFFER_FULL:
                 ESP_LOGE(TAG, "ring buffer full");
                 // If buffer full happened, you should consider increasing your buffer size
                 // As an example, we directly flush the rx buffer here in order to read more data.
-                uart_flush_input(UART_NUM_0);
-                xQueueReset(uart0_queue);
+                uart_flush_input(UART_NUM_2);
+                xQueueReset(uart2_queue);
                 break;
             //Event of UART RX break detected
             case UART_BREAK:
@@ -128,6 +131,9 @@ static void uart_event_task(void *pvParameters)
                 ESP_LOGI(TAG, "uart event type: %d", event.type);
                 break;
             }
+        } else {
+            char* message = "hello there!\n";
+            uart_write_bytes(UART_NUM_2, message, strlen(message));
         }
     }
     free(dtmp);
@@ -140,7 +146,7 @@ void setup_uart() {
 
     /* Configure parameters of an UART driver,
      * communication pins and install the driver */
-    uart_config_t uart_config = {
+    uart_config_t uart_config0 = {
         .baud_rate = 922190,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
@@ -149,8 +155,8 @@ void setup_uart() {
         .source_clk = UART_SCLK_DEFAULT,
     };
     //Install UART driver, and get the queue.
-    uart_driver_install(UART_NUM_0, BUF_SIZE * 2, BUF_SIZE * 2, 20, &uart0_queue, 0);
-    uart_param_config(UART_NUM_0, &uart_config);
+    uart_driver_install(UART_NUM_0, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
+    uart_param_config(UART_NUM_0, &uart_config0);
 
     //Set UART log level
     esp_log_level_set(TAG, ESP_LOG_INFO);
@@ -158,6 +164,24 @@ void setup_uart() {
     uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
     uart_disable_pattern_det_intr(UART_NUM_0);
+
+    // UART 2
+    uart_config_t uart_config2 = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    //Install UART driver, and get the queue.
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_2, BUF_SIZE * 2, BUF_SIZE * 2, 20, &uart2_queue, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_2, &uart_config2));
+
+    //Set UART pins (using UART0 default pins ie no changes.)
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, 17, 16, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    uart_disable_pattern_det_intr(UART_NUM_2);
 
     xTaskCreate(uart_event_task, "uart_event_task", 3072, NULL, 12, NULL);
 }

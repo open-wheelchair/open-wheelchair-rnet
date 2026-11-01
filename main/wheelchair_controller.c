@@ -77,8 +77,6 @@ uint8_t hardcoded_parameters[][2][8] = {
 // each module has following interface:
 // poll(time) -> non-blocking, called every 1ms, can be used to transmit messages
 // recv(frame, time) -> non-blocking frame handling, updates internal state, should not send messages
-// modules also have access to the global object? or how do they pass info between them?
-// how do modules tell other modules they should start?
 
 typedef enum {
     INIT_STATE_POWERON,
@@ -158,14 +156,39 @@ typedef enum mode_state_fsm_substate_t {
     MODE_STATE_ON_CLOSE,
 } mode_state_fsm_substate_t;
 
+typedef enum seating_axis_fsm_substate_t {
+    SEATING_AXIS_EXPECTED,
+    SEATING_AXIS_OPEN,
+    SEATING_AXIS_RECEIVED_OPEN,
+    SEATING_AXIS_CLOSED
+} seating_axis_fsm_substate_t;
+
+const uint8_t SEATING_AXIS_ID_TRANSITION_LIMIT = (10);
+
 typedef struct {
     uint8_t current_mode;
     uint8_t desired_mode;
-    int64_t ts_transition_begin;
-
+    int64_t ts_mode_transition_begin;
     mode_state_fsm_substate_t mode_fsm;
 
+    // The seating mode also has multiple seat moving axes
+    // TODO add deadline for seating FSM to resolve
+    seating_axis_fsm_substate_t seating_fsm;
+
+    // We haven't discovered a good way to find out which seating axes exist
+    // So we just limit the amount of seating transitions
+    uint8_t seating_transitions_allowed_remaining;
+    bool pulse_sent;
+    int64_t ts_start_pulse;
+
+    uint8_t desired_seating_axis;
+    uint8_t current_seating_axis;
+
+    // members below are static
+
+    // static ID of the 'drive' mode (0)
     uint8_t known_drive_mode;
+    // static ID of the 'seating' mode (1)
     uint8_t known_seating_mode;
 } mode_state_t;
 
@@ -173,11 +196,11 @@ typedef struct {
     can_hardware_ctx_t* hw_ctx;
 
     uint8_t own_node_address;
+    uint8_t ism_node_address;
     uint8_t pm_node_address;
 
     bool sent_poweron;
 
-    bool do_joystick_position_publish;
     int64_t ts_joystick_position_publication;
 
     bool do_pmtx_heartbeat_publish;
@@ -273,12 +296,11 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
                 };
                 send_can_message(state->hw_ctx, &msg_open_mode);
                 state->mode_substate.mode_fsm = MODE_STATE_OPENING;
-                state->mode_substate.ts_transition_begin = timestamp;
+                state->mode_substate.ts_mode_transition_begin = timestamp;
                 break;
             }
             case MODE_STATE_ON_CLOSE: {
-                // TODO this should not compile
-                state->mode_substate.mode_fsm = MODE_STATE_CLOSING;
+                state->mode_substate.mode_fsm = MODE_STATE_FULLY_CLOSED;
                 break;
             }
 
@@ -290,8 +312,14 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
                         .data = {0} // TODO this can be changed!
                     };
                     send_can_message(state->hw_ctx, &msg_maxspeed);
+                    state->mode_substate.mode_fsm = MODE_STATE_FULLY_OPEN;
                 }
-                state->mode_substate.mode_fsm = MODE_STATE_FULLY_OPEN;
+                if (state->mode_substate.current_mode == state->mode_substate.known_seating_mode) {
+                    state->mode_substate.seating_fsm = SEATING_AXIS_EXPECTED;
+                    state->mode_substate.mode_fsm = MODE_STATE_FULLY_OPEN;
+                    state->mode_substate.seating_transitions_allowed_remaining = SEATING_AXIS_ID_TRANSITION_LIMIT;
+                }
+
                 break;
             }
 
@@ -306,14 +334,14 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
                     };
                     send_can_message(state->hw_ctx, &msg_close_mode);
                     state->mode_substate.mode_fsm = MODE_STATE_CLOSING;
-                    state->mode_substate.ts_transition_begin = timestamp;
+                    state->mode_substate.ts_mode_transition_begin = timestamp;
                     }
                 break;
             }
 
             case MODE_STATE_CLOSING:
             case MODE_STATE_OPENING: {
-                if (timestamp - state->mode_substate.ts_transition_begin > 5000*1000) {
+                if (timestamp - state->mode_substate.ts_mode_transition_begin > 5000*1000) {
                     ESP_LOGE(TAG, "mode transition took too long");
                     abort();
                 }
@@ -487,14 +515,17 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
 
     // joystick timer
     if (state->init_fsm == INIT_STATE_DONE && state->mode_substate.mode_fsm == MODE_STATE_FULLY_OPEN) {
-        if (timestamp - state->ts_joystick_position_publication > 20*1000) {
-            uint8_t right = 0;
-            uint8_t fwd = 0;
-            bool is_seating_mode = true;
-            pal_get_joystick(&right, &fwd, &is_seating_mode);
+        bool wait_for_seating_axis_info = (
+            state->mode_substate.current_mode == state->mode_substate.known_seating_mode
+            && state->mode_substate.seating_fsm != SEATING_AXIS_CLOSED
+        );
 
-            // check that mode is current mode is mode specified by input, else set desired mode to the input mode
-            if (is_seating_mode) {
+        if (timestamp - state->ts_joystick_position_publication > 20*1000) {
+            pal_output_t pal = {0};
+            pal_get_joystick(&pal);
+
+            // check that mode is current mode is mode specified by PAL input, else set desired mode to the input mode
+            if (pal.is_seating_mode) {
                 if (state->mode_substate.current_mode != state->mode_substate.known_seating_mode) {
                     state->mode_substate.desired_mode = state->mode_substate.known_seating_mode;
                     return;
@@ -505,6 +536,45 @@ void init_poll(joystick_state_t* state, int64_t timestamp) {
                     return;
                 }
             }
+
+            uint8_t right = pal.right;
+            uint8_t fwd = pal.fwd;
+
+            // Check that seating axis is as specified by input, else transmit direction change pulse
+            if (!wait_for_seating_axis_info && pal.is_seating_mode && state->mode_substate.current_seating_axis != pal.seating_axis && pal.seating_axis != PAL_SENTINEL_KEEP_SEATING_AXIS_SAME) {
+                if (!state->mode_substate.pulse_sent) {
+                    if (state->mode_substate.seating_transitions_allowed_remaining > 0) {
+                        state->mode_substate.seating_transitions_allowed_remaining--;
+                    } else {
+                        ESP_LOGE(TAG, "exceeded number of axis pulses");
+                        abort();
+                    }
+
+                    state->mode_substate.ts_start_pulse = timestamp;
+                    state->mode_substate.pulse_sent = true;
+                    right = 75; // positive 75
+                    fwd = 0;
+                } else if (state->mode_substate.pulse_sent && timestamp - state->mode_substate.ts_start_pulse <= 500*1000) {
+                    // keep seat axis changing pulse
+                    right = 75; // positive 75
+                    fwd = 0;
+                } else if (state->mode_substate.pulse_sent) {
+                    // elapsed, now block and wait for seat info
+                    // TODO monitor deadline for seating axis info
+                    state->mode_substate.seating_fsm = SEATING_AXIS_EXPECTED;
+                }
+            }
+
+            if (!wait_for_seating_axis_info && pal.is_seating_mode && state->mode_substate.current_seating_axis == pal.seating_axis) {
+                // we are in the correct axis, reset budget for next axis transition
+                state->mode_substate.seating_transitions_allowed_remaining = SEATING_AXIS_ID_TRANSITION_LIMIT;
+            }
+
+            if (wait_for_seating_axis_info) {
+                right = 0;
+                fwd = 0;
+            }
+
             can_frame_t msg_joystick = {
                     .can_id = 0x02000000 | state->own_node_address << 8 | CAN_EFF_FLAG,
                     .can_dlc = 2,
@@ -594,6 +664,47 @@ void init_receive(joystick_state_t* state, int64_t timestamp, can_frame_t* frame
             }
         }
     }
+    if ((frame->can_id & CAN_EFF_FLAG) && ((frame->can_id & CAN_EFF_MASK & 0xffff0000) == 0x0c180000)) {
+        // these messages are sent after changing seat axis or after changing mode to seating mode
+        uint8_t from_node = ((frame->can_id & CAN_EFF_MASK) >> 8) & 0xf;
+        uint8_t topic = ((frame->can_id & CAN_EFF_MASK)) & 0xf;
+
+        if (from_node == state->ism_node_address) {
+            if (topic == 0 && frame->can_dlc == 2 && frame->data[0] == 0x02 && frame->data[1] == 0x02) {
+                if (state->mode_substate.seating_fsm != SEATING_AXIS_EXPECTED && state->mode_substate.seating_fsm != SEATING_AXIS_CLOSED) {
+                    ESP_LOGE(TAG, "unexpected seating state on open %d", state->mode_substate.seating_fsm);
+                    abort();
+                }
+                state->mode_substate.seating_fsm = SEATING_AXIS_OPEN;
+            }
+            if (topic == 1 && frame->can_dlc == 3 && frame->data[1] == 1 && frame->data[2] == 1) {
+                // We don't really know which of the messages indicate the axis, so just pick one which matches 0x20 bitmask (based on nothing concrete, but in the observed data, there's only one)
+                if (state->mode_substate.seating_fsm != SEATING_AXIS_OPEN && state->mode_substate.seating_fsm != SEATING_AXIS_RECEIVED_OPEN) {
+                    ESP_LOGE(TAG, "unexpected seating state on candidate %d", state->mode_substate.seating_fsm);
+                    abort();
+                }
+                uint8_t candidate_axis = frame->data[0];
+                if ((candidate_axis & 0x20) != 0) {
+                    if (state->mode_substate.seating_fsm == SEATING_AXIS_RECEIVED_OPEN) {
+                        ESP_LOGE(TAG, "received two candidates");
+                        abort();
+                    }
+                    state->mode_substate.seating_fsm = SEATING_AXIS_RECEIVED_OPEN;
+                    state->mode_substate.current_seating_axis = candidate_axis;
+                    ESP_LOGI(TAG, "seating axis: %02x", candidate_axis);
+                }
+            }
+            if (topic == 0 && frame->can_dlc == 2 && frame->data[0] == 0x02 && frame->data[1] == 0x01) {
+                if (state->mode_substate.seating_fsm != SEATING_AXIS_RECEIVED_OPEN) {
+                    ESP_LOGE(TAG, "unexpected seating state on close %d", state->mode_substate.seating_fsm);
+                    abort();
+                }
+                state->mode_substate.seating_fsm = SEATING_AXIS_CLOSED;
+                // now we can send a new pulse
+                state->mode_substate.pulse_sent = false;
+            }
+        }
+    }
 
 
     // INIT subsystem
@@ -667,7 +778,8 @@ void comms_task(void* pvParam) {
 
     joystick_state_t state = {.hw_ctx = ctx, .init_fsm = INIT_STATE_POWERON,
         .own_node_address = 0, // first in the auth sequence
-        .pm_node_address = 2, // TODO find this dynamically
+        .ism_node_address = 1,
+        .pm_node_address = 2, // TODO find these addresses dynamically
 
         .ready_substate = {
             .bitmask_expected = 0b111, // three nodes
@@ -692,7 +804,7 @@ void comms_task(void* pvParam) {
     }
 
 
-    // TODO implement
+    // TODO implement again
     // can_frame_t toggle_lights = {
     //     .can_dlc = 0,
     //     .can_id = CAN_EFF_FLAG | 0x0c000004,

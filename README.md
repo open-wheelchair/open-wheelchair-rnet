@@ -71,3 +71,7 @@ Rewrote the software to be async and use state machines instead of the code bein
 ## 2026-10-30
 
 Added mode changing to seating mode (so now you can both drive & change seating, but not at the same time). Also investigated turning on more compiler warnings to get more warnings, but was unfortunately stopped by the code in the ESP-IDF not being warning-free, so then I'd have to turn off `-Werror`. Might still be useful to turn them on before each release, just to check that there are no warnings in our own code.
+
+## 2026-11-01
+
+Added logic to automatically go to a certain seating axis in seating mode. The UART input link is now on a separate physical port, in preparation of also sending data back from the chair to attached computer/device, the other built-in UART to USB port is still used for logs. The input UART also takes in a seating axis ID. The code makes sure that seating commands / drive commands don't get mixed up, and that no movement happens while the internal state of the wheelchair is settling. I really love state machines!
